@@ -2,6 +2,7 @@ from PIL import Image
 from wand.image import Image as wandImage
 from wand.color import Color
 from mrjob.job import MRJob
+from multiprocessing import Pool
 import cv2
 import PyPDF2
 import pytesseract
@@ -12,18 +13,18 @@ import pandas as pd
 import tempfile
 import pickle
 import boto3
+from multiprocessing import Pool
+from multiprocessing import Queue
 
 parser = argparse.ArgumentParser(description='Use tesseract to process a pdf.')
 parser.add_argument('filename', help='Name of pdf file to parse')
-parser.add_argument('pagenum', type=int, help='page number to extract and parse')
+parser.add_argument('pagenum', type=int, help='Page number to extract and parse')
 args = parser.parse_args()
-
 
 #args = {"filename": "1863Langley/1863Langley.pdf", "pagenum": 360, "resolution": 300, "preprocess": "thresh"}
 
-def pdf_page_to_img(filename, pagenum, resolution=300, preprocess="thresh"):
+def pdf_page_to_img(src_pdf, pagenum, resolution=300, preprocess="thresh"):
 
-    src_pdf = PyPDF2.PdfFileReader(filename)
     dst_pdf = PyPDF2.PdfFileWriter()
     dst_pdf.addPage(src_pdf.getPage(pagenum))
     pdf_bytes = io.BytesIO()
@@ -49,15 +50,15 @@ def pdf_page_to_img(filename, pagenum, resolution=300, preprocess="thresh"):
 
     return Image.fromarray(gray)
 
-def ocr(image, verbose=True, debug=False):
+def ocr(image, debug=False):
     # load the image as a PIL/Pillow image, apply OCR
     pagecontents = {}
     data = pytesseract.image_to_data(image, output_type="df.frame")
     boxes = pytesseract.image_to_boxes(image)
     try:
-        df = pd.read_csv(io.StringIO(data), sep="\t")
-        df = df.loc[(list(map(lambda x: str(x).strip()!='', df['text'])) & (df['conf']> -1) & (df['text']).notnull())]
-        df = df.set_index(["block_num","par_num"])
+        df = pd.read_csv(io.StringIO(data), sep="\t", quoting=csv.QUOTE_NONE, encoding='utf-8', engine='python')
+        dfm = df.loc[(list(map(lambda x: str(x).strip()!='', df['text'])) & (df['conf']> -1) & (df['text']).notnull())]
+        df = dfm.set_index(["block_num","par_num"])
         blockstats = {'block':[], 'n_par':[], 'n_line':[], 'top_at':[], 'bottom_at':[], 'left_at':[], 'right_at':[]}
         paragraphs = {}
         for block in df.index.levels[0]:
@@ -83,16 +84,49 @@ def ocr(image, verbose=True, debug=False):
         print(imgfilename)
         pagecontents['filename'] = imgfilename
         image.save(imgfilename)
-
-    if verbose == True:
-        df = pd.read_csv(io.StringIO(data), sep="\t")
-        df = df.loc[(list(map(lambda x: str(x).strip()!='', df['text'])) & (df['conf']> -1) & (df['text']).notnull())]
-        pagecontents['data'] = df
-        #pagecontents['boxes'] = pd.read_csv(io.StringIO(boxes), sep="\s", header=None, names=["character", "x1","y1","x2","y2","c"])
+       
+    pagecontents['data'] = dfm
+    pagecontents['boxes'] = pd.read_csv(io.StringIO(boxes), quoting=csv.QUOTE_NONE, encoding='utf-8', engine='python',
+                                            sep="\s", header=None, names=["character", "x1","y1","x2","y2","c"])
 
     return pagecontents
 
-contents = ocr(pdf_page_to_img(args.filename, args.pagenum))
+def ocr_list(src_pdf):
+    num_pages = src_pdf.getNumPages()
+    contents = {}
+    pages = []
+    for i in range(multiprocessing.cpu_count()):
+        for page in src_pdf.getNumPages():
+            contents[page] = ocr(pdf_page_to_img(src_pdf, args.pagenum))
+            
+    return contents
+
+
+src_pdf = PyPDF2.PdfFileReader(args.filename)
+    
+    
+q = Queue()
+
+def hello(n):
+    time.sleep(random.randint(1,3))
+    q.put(os.getpid())
+    print("[{0}] Hello!".format(n))
+
+processes = [ ]
+for i in range(10):
+    t = multiprocessing.Process(target=hello, args=(i,))
+    processes.append(t)
+    t.start()
+
+for one_process in processes:
+    one_process.join()
+
+mylist = [ ]
+while not q.empty():
+    mylist.append(q.get())
+
+    
+    
 pickle.dump( contents, open( "contents.p", "wb" ) )
 
 # with open('contents.p', 'rb') as pickle_file:
