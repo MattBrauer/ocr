@@ -1,9 +1,16 @@
+# script to process vi tesseract ocr a single pdf file, writing the results into
+# a pickle file. Writes to a temp file for each core then combines these into
+# a single file, name given on the command line.
+
+# ex:
+# python pdf_ocr.py 1863Langley/1863Langley.pdf 1863Langley.p
+
 from PIL import Image
 from wand.image import Image as wandImage
 from wand.color import Color
 from mrjob.job import MRJob
-from multiprocessing import Pool
 import cv2
+import csv
 import PyPDF2
 import pytesseract
 import argparse
@@ -13,15 +20,7 @@ import pandas as pd
 import tempfile
 import pickle
 import boto3
-from multiprocessing import Pool
-from multiprocessing import Queue
-
-parser = argparse.ArgumentParser(description='Use tesseract to process a pdf.')
-parser.add_argument('filename', help='Name of pdf file to parse')
-parser.add_argument('pagenum', type=int, help='Page number to extract and parse')
-args = parser.parse_args()
-
-#args = {"filename": "1863Langley/1863Langley.pdf", "pagenum": 360, "resolution": 300, "preprocess": "thresh"}
+import multiprocessing
 
 def pdf_page_to_img(src_pdf, pagenum, resolution=300, preprocess="thresh"):
 
@@ -50,7 +49,7 @@ def pdf_page_to_img(src_pdf, pagenum, resolution=300, preprocess="thresh"):
 
     return Image.fromarray(gray)
 
-def ocr(image, debug=False):
+def ocr(image, pagenum):
     # load the image as a PIL/Pillow image, apply OCR
     pagecontents = {}
     data = pytesseract.image_to_data(image, output_type="df.frame")
@@ -75,59 +74,61 @@ def ocr(image, debug=False):
         blockstats = pd.DataFrame(data=blockstats).set_index('block')
         pagecontents['blockstats'] = blockstats
         pagecontents['paragraphs'] = paragraphs
+        pagecontents['data'] = dfm
+        pagecontents['boxes'] = pd.read_csv(io.StringIO(boxes), quoting=csv.QUOTE_NONE, encoding='utf-8', engine='python',
+                                                sep="\s", header=None, names=["character", "x1","y1","x2","y2","c"])
     except:
-        print("exception")
-
-    if debug == True:
-        tmp = tempfile.mkstemp(suffix='.png', prefix='tmp', dir=None, text=False)
-        imgfilename = tmp[1]
-        print(imgfilename)
-        pagecontents['filename'] = imgfilename
-        image.save(imgfilename)
+        print("exception: "+str(pagenum))
        
-    pagecontents['data'] = dfm
-    pagecontents['boxes'] = pd.read_csv(io.StringIO(boxes), quoting=csv.QUOTE_NONE, encoding='utf-8', engine='python',
-                                            sep="\s", header=None, names=["character", "x1","y1","x2","y2","c"])
+    pagecontents['pagenum'] = pagenum
 
     return pagecontents
 
-def ocr_list(src_pdf):
+def ocr_page(procnum,num_pages):
+    proccontents = {}
+    pagerange = range(procnum, num_pages, num_cpus)
+    for pagenum in pagerange:
+        page_img = pdf_page_to_img(src_pdf, pagenum)
+        proccontents[pagenum] = ocr(page_img, pagenum)
+        print("page [{0}]".format(pagenum))
+        #q.put(contents)
+    pickle.dump( proccontents, open( "contents."+str(procnum)+".p", "wb" ) )
+    return proccontents
+
+if __name__ == "__main__":
+
+    # python pdf_ocr.py 1863Langley/1863Langley.pdf
+
+    parser = argparse.ArgumentParser(description='Use tesseract to process a pdf.')
+    parser.add_argument('filename', help='Name of pdf file to parse')
+    parser.add_argument('outfilename', help='Name of output pickle file')
+    args = parser.parse_args()
+    
+    src_pdf = PyPDF2.PdfFileReader(args.filename)
     num_pages = src_pdf.getNumPages()
+    num_cpus = multiprocessing.cpu_count()
+
     contents = {}
+    proccontents = {}
     pages = []
-    for i in range(multiprocessing.cpu_count()):
-        for page in src_pdf.getNumPages():
-            contents[page] = ocr(pdf_page_to_img(src_pdf, args.pagenum))
-            
-    return contents
 
+    processes = []
 
-src_pdf = PyPDF2.PdfFileReader(args.filename)
-    
-    
-q = Queue()
+    for procnum in range(num_cpus):
+        t = multiprocessing.Process(target=ocr_page, args=(procnum,num_pages,))
+        processes.append(t)
+        print("starting {0}".format(procnum))
+        t.start()
 
-def hello(n):
-    time.sleep(random.randint(1,3))
-    q.put(os.getpid())
-    print("[{0}] Hello!".format(n))
+    for p in processes:
+        print("joining...")
+        p.join()
 
-processes = [ ]
-for i in range(10):
-    t = multiprocessing.Process(target=hello, args=(i,))
-    processes.append(t)
-    t.start()
+    contents = {}
+    for i in range(4):
+        cont = pickle.load(open("contents."+str(i)+".p", "rb"))
+        for kv in cont.keys():
+            contents[kv] = cont[kv]
 
-for one_process in processes:
-    one_process.join()
-
-mylist = [ ]
-while not q.empty():
-    mylist.append(q.get())
-
-    
-    
-pickle.dump( contents, open( "contents.p", "wb" ) )
-
-# with open('contents.p', 'rb') as pickle_file:
-#     c = pickle.load(pickle_file)
+    pickle.dump( contents, open( args.outfilename + ".p", "wb" ) )
+#    contents = pickle.load( open( "contents.p", "rb" ) )
